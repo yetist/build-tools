@@ -1,0 +1,142 @@
+# Maintainer: Evangelos Foutras <evangelos@foutrelis.com>
+# Contributor: Jan "heftig" Steffens <jan.steffens@gmail.com>
+
+pkgname=clang
+pkgver=8.0.1
+_rdate=20211103
+pkgrel=2
+pkgdesc="C language family frontend for LLVM"
+arch=('loongarch64' 'x86_64')
+url="https://clang.llvm.org/"
+license=('custom:Apache 2.0 with LLVM Exception')
+depends=('llvm-libs' 'gcc' 'compiler-rt')
+makedepends=('llvm' 'cmake' 'ninja' 'python-sphinx' 'python2')
+optdepends=('openmp: OpenMP support in clang with -fopenmp'
+            'python: for scan-view and git-clang-format'
+            'llvm: referenced by some clang headers')
+provides=("clang-analyzer=$pkgver" "clang-tools-extra=$pkgver")
+conflicts=('clang-analyzer' 'clang-tools-extra')
+replaces=('clang-analyzer' 'clang-tools-extra')
+_source_base=http://loongarch.dev
+source=($_source_base/clang/clang-${pkgver}-${_rdate}.tar.xz/609e910639e944fea763f7312444f313/clang-${pkgver}-${_rdate}.tar.xz
+        $_source_base/clang-tools-extra/clang-tools-extra-$pkgver-${_rdate}.tar.xz/8bffac33d5de89fa2f3d37eebad78b9c/clang-tools-extra-$pkgver-${_rdate}.tar.xz
+        $_source_base/llvm/llvm-$pkgver-${_rdate}.tar.xz/4aef139ba3c06f58e08babe9677166b5/llvm-$pkgver-${_rdate}.tar.xz)
+sha256sums=('f0f2b177e1483ad38d5cb9ceb34d35b09797894f2f27e68111e4e4e31ecdfa22'
+            'f6bb58363778e4585a8cd0450ab81bf94f8db5b4dfa644eb196eedb4ce64276e'
+            '701127b16d87a9858afe90c4885dd8755bdbd0d776e174b3ed589225280f74c5')
+validpgpkeys+=('B6C8F98282B944E3B0D5C2530FC3042E345AD05D') # Hans Wennborg <hans@chromium.org>
+validpgpkeys+=('474E22316ABF4785A88C6E8EA2C794A986419D8A') # Tom Stellard <tstellar@redhat.com>
+
+# Utilizing LLVM_DISTRIBUTION_COMPONENTS to avoid
+# installing static libraries; inspired by Gentoo
+_get_distribution_components() {
+  local target
+  ninja -t targets | grep -Po 'install-\K.*(?=-stripped:)' | while read -r target; do
+    case $target in
+      clang-libraries|distribution)
+        continue
+        ;;
+      clang-tidy-headers)
+        continue
+        ;;
+      clang|clangd|clang-*)
+        ;;
+      clang*|findAllSymbols)
+        continue
+        ;;
+    esac
+    echo $target
+  done
+}
+
+prepare() {
+  cd "$srcdir/$pkgname-$pkgver.src"
+  mkdir -p build
+  mv "$srcdir/clang-tools-extra-$pkgver.src" tools/extra
+
+  #if [[ $pkgver != 10.* ]]; then
+  #  echo "Remove libclangHandleLLVM hack!"
+  #  return 1
+  #fi
+  # Remove libclangHandleLLVM; breaks zig (https://reviews.llvm.org/D75579)
+  sed -i '/add_clang_subdirectory(handle-llvm)/d' \
+    tools/clang-fuzzer/CMakeLists.txt
+}
+
+build() {
+  cd "$srcdir/$pkgname-$pkgver.src/build"
+
+  local cmake_args=(
+    -G Ninja
+    -DCMAKE_BUILD_TYPE=Release
+    -DCMAKE_INSTALL_PREFIX=/usr
+    -DLLVM_LINK_LLVM_DYLIB=ON
+    -DCLANG_LINK_CLANG_DYLIB=ON
+    -DLLVM_ENABLE_RTTI=ON
+    -DLLVM_BUILD_TESTS=ON
+    -DLLVM_INCLUDE_DOCS=ON
+    -DLLVM_BUILD_DOCS=ON
+    -DLLVM_ENABLE_SPHINX=ON
+    -DSPHINX_WARNINGS_AS_ERRORS=OFF
+    -DLLVM_EXTERNAL_LIT=/usr/bin/lit
+    -DLLVM_MAIN_SRC_DIR="$srcdir/llvm-$pkgver.src"
+  )
+
+  cmake .. "${cmake_args[@]}"
+  local distribution_components=$(_get_distribution_components | paste -sd\;)
+  test -n "$distribution_components"
+  cmake_args+=(-DLLVM_DISTRIBUTION_COMPONENTS="$distribution_components")
+
+  cmake .. "${cmake_args[@]}"
+  ninja
+}
+
+check() {
+  cd "$srcdir/$pkgname-$pkgver.src/build"
+  #ninja check-clang{,-tools}
+}
+
+_python2_optimize() {
+  python2 -m compileall "$@"
+  python2 -O -m compileall "$@"
+}
+
+_python3_optimize() {
+  python3 -m compileall "$@"
+  python3 -O -m compileall "$@"
+  python3 -OO -m compileall "$@"
+}
+
+package() {
+  cd "$srcdir/$pkgname-$pkgver.src/build"
+
+  #DESTDIR="$pkgdir" ninja install-distribution
+  DESTDIR="$pkgdir" ninja install
+  install -Dm644 ../LICENSE.TXT "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+
+  # Remove documentation sources
+  rm -r "$pkgdir"/usr/share/doc/clang{,-tools}/html/{_sources,.buildinfo}
+
+  # Move analyzer scripts out of /usr/libexec
+  mv "$pkgdir"/usr/libexec/{ccc,c++}-analyzer "$pkgdir/usr/lib/clang/"
+  rmdir "$pkgdir/usr/libexec"
+  sed -i 's|libexec|lib/clang|' "$pkgdir/usr/bin/scan-build"
+
+  # Install Python bindings
+  for _py in 2.7 3.9; do
+    install -d "$pkgdir/usr/lib/python$_py/site-packages"
+    cp -a ../bindings/python/clang "$pkgdir/usr/lib/python$_py/site-packages/"
+    _python${_py%%.*}_optimize "$pkgdir/usr/lib/python$_py"
+  done
+
+  # Fix shebang in Python 2 script
+  sed -i '1s|/usr/bin/env python$|&2|' \
+    "$pkgdir"/usr/share/$pkgname/run-find-all-symbols.py
+  touch -d @$SOURCE_DATE_EPOCH "$pkgdir"/usr/share/$pkgname/run-find-all-symbols.py
+
+  # Compile Python scripts
+  _python2_optimize "$pkgdir/usr/share/clang"
+  _python3_optimize "$pkgdir/usr/share" -x 'clang-include-fixer|run-find-all-symbols'
+}
+
+# vim:set ts=2 sw=2 et:
